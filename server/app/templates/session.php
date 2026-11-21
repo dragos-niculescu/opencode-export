@@ -102,6 +102,28 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
   padding: .1rem .5rem; border-radius: 999px; font-size: .72rem; font-weight: 600;
 }
 
+/* ---- Table of contents and collapse control ---- */
+.toc-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 1rem 1.25rem; margin-bottom: 2rem; box-shadow: var(--shadow);
+}
+.toc-card h2 { font-size: 1rem; margin-bottom: .65rem; }
+.toc-list { margin: 0; padding-left: 1.4rem; }
+.toc-list li { margin: .25rem 0; color: var(--text-muted); }
+.toc-list a { overflow-wrap: anywhere; }
+.collapse-toggle {
+  position: fixed; top: .75rem; right: 3.35rem; z-index: 50;
+  min-width: 2.2rem; height: 2.2rem; padding: 0 .65rem; border-radius: 999px;
+  font-size: .8rem; font-weight: 600; line-height: 1;
+  background: var(--bg-card, var(--bg)); color: var(--text);
+  border: 1px solid var(--border); box-shadow: var(--shadow); cursor: pointer;
+}
+.collapse-toggle:hover { background: var(--bg-alt); }
+.message.role-assistant .msg-body { display: block; }
+.message.role-assistant.is-collapsed .msg-body { display: none; }
+.message.role-assistant.is-collapsed .msg-header { margin-bottom: 0; cursor: pointer; }
+@media print { .collapse-toggle { display: none; } }
+
 /* ---- Messages ---- */
 .messages { display: flex; flex-direction: column; gap: 1.5rem; }
 
@@ -113,6 +135,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
 }
 .message.role-user      { background: var(--user-bg); border-color: var(--user-border); }
 .message.role-assistant { background: var(--ai-bg);   border-color: var(--ai-border);   }
+.message.role-system    { background: var(--bg-alt);  border-color: var(--border);      }
 .message.role-unknown   { background: var(--bg-alt); }
 
 .msg-header {
@@ -132,6 +155,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
 }
 .role-user      .role-badge { background: var(--accent); color: #fff; }
 .role-assistant .role-badge { background: #555; color: #fff; }
+.role-system    .role-badge { background: #777; color: #fff; }
 .role-unknown   .role-badge { background: #888; color: #fff; }
 .msg-model  { font-size: .8rem; color: var(--text-muted); }
 .msg-time   { font-size: .75rem; color: var(--text-muted); margin-left: auto; }
@@ -261,6 +285,19 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
 .compaction-icon { font-size: 1.1rem; flex-shrink: 0; }
 .compaction-label { font-style: italic; }
 
+/* ---- Part: note / system ---- */
+.part-note {
+  padding: .5rem .75rem;
+  margin: .5rem 0;
+  background: var(--bg-alt);
+  border-left: 3px solid var(--border);
+  border-radius: 0 4px 4px 0;
+  font-size: .85rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ---- Part: unknown ---- */
 .part-unknown {
   background: var(--bg-alt);
@@ -372,6 +409,7 @@ dialog .link { font-family: monospace; word-break: break-all; }
 </head>
 <body>
 <?= theme_toggle() ?>
+<button type="button" class="collapse-toggle" id="collapse-toggle" aria-pressed="false" title="Collapse all agent answers">Collapse answers</button>
 <div class="page-wrapper<?= $edit ? ' editing' : '' ?>">
 <?php if ($edit): ?>
   <div class="ed-bar" data-slug="<?= h($row['slug']) ?>">
@@ -436,6 +474,34 @@ dialog .link { font-family: monospace; word-break: break-all; }
     <?php endif; ?>
   </div>
 
+  <!-- Question table of contents -->
+  <?php
+    $questions = [];
+    foreach ($payload["messages"] as $k => $tocMsg) {
+      if (($tocMsg["role"] ?? "") !== "user") continue;
+      $label = "";
+      foreach (is_array($tocMsg["parts"] ?? null) ? $tocMsg["parts"] : [] as $tocPart) {
+        if (is_array($tocPart) && ($tocPart["type"] ?? "") === "text") {
+          $label = trim(preg_replace("/\s+/u", " ", (string)($tocPart["text"] ?? "")) ?? "");
+          if ($label !== "") break;
+        }
+      }
+      if ($label === "") $label = "User question " . ($k + 1);
+      if (preg_match("/\A(.{137}).+/us", $label, $short)) $label = rtrim($short[1]) . "...";
+      $questions[] = ["index" => $offset + $k, "label" => $label];
+    }
+  ?>
+  <?php if ($questions): ?>
+  <nav class="toc-card" aria-label="Questions in this session">
+    <h2>Questions</h2>
+    <ol class="toc-list">
+      <?php foreach ($questions as $question): ?>
+      <li><a href="#message-<?= (int)$question["index"] ?>"><?= h($question["label"]) ?></a></li>
+      <?php endforeach; ?>
+    </ol>
+  </nav>
+  <?php endif; ?>
+
   <!-- Messages -->
   <?php
     $slugUrl = function (int $p) use ($row, $edit): string {
@@ -449,13 +515,13 @@ dialog .link { font-family: monospace; word-break: break-all; }
     <?php foreach ($payload['messages'] as $k => $msg):
       $mi        = $offset + $k;
       $role      = is_string($msg['role'] ?? null) ? $msg['role'] : 'unknown';
-      $roleClass = in_array($role, ['user', 'assistant'], true) ? 'role-' . $role : 'role-unknown';
+      $roleClass = in_array($role, ['user', 'assistant', 'system'], true) ? 'role-' . $role : 'role-unknown';
       $modelStr  = format_model($msg['model'] ?? null);
       $msgTime   = isset($msg['time_created']) ? format_ts($msg['time_created']) : '';
       $msgTokens = is_array($msg['tokens'] ?? null) ? $msg['tokens'] : null;
       $msgCost   = $msg['cost']   ?? null;
     ?>
-    <div class="message <?= $roleClass ?>" data-mi="<?= $mi ?>">
+    <div class="message <?= $roleClass ?>" id="message-<?= $mi ?>" data-mi="<?= $mi ?>">
       <div class="msg-header">
         <span class="role-badge"><?= h($role) ?></span>
         <?php if ($modelStr): ?>
@@ -470,6 +536,7 @@ dialog .link { font-family: monospace; word-break: break-all; }
         <?php if ($msgTime): ?><span class="msg-time"><?= h($msgTime) ?></span><?php endif; ?>
         <?php if ($edit): ?><span class="ed-msg"><button type="button" class="ed-del-msg" title="Delete this message">&#x2715; message</button></span><?php endif; ?>
       </div>
+      <div class="msg-body">
       <?php foreach (is_array($msg['parts'] ?? null) ? $msg['parts'] : [] as $j => $part):
         if (!is_array($part)) continue;
         $html = render_part($part, $pd);
@@ -491,6 +558,7 @@ dialog .link { font-family: monospace; word-break: break-all; }
         <?= $html ?>
       </div>
       <?php endforeach; ?>
+      </div>
     </div>
     <?php endforeach; ?>
   </div>
@@ -668,6 +736,42 @@ dialog .link { font-family: monospace; word-break: break-all; }
 <script nonce="<?= $nonce ?>">
 document.addEventListener('DOMContentLoaded', function () {
   if (window.hljs) hljs.highlightAll();
+
+  var collapseButton = document.getElementById('collapse-toggle');
+  var agentMessages = Array.prototype.slice.call(document.querySelectorAll('.message.role-assistant'));
+  var answersCollapsed = false;
+
+  function setAnswersCollapsed(collapsed) {
+    answersCollapsed = collapsed;
+    agentMessages.forEach(function (message) {
+      message.classList.toggle('is-collapsed', collapsed);
+    });
+    if (collapseButton) {
+      collapseButton.textContent = collapsed ? 'Expand answers' : 'Collapse answers';
+      collapseButton.title = collapsed ? 'Expand all agent answers' : 'Collapse all agent answers';
+      collapseButton.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+    }
+  }
+
+  if (collapseButton) {
+    collapseButton.hidden = agentMessages.length === 0;
+    collapseButton.addEventListener('click', function () {
+      setAnswersCollapsed(!answersCollapsed);
+    });
+  }
+
+  agentMessages.forEach(function (message) {
+    var header = message.querySelector('.msg-header');
+    if (header) {
+      header.addEventListener('click', function () {
+        if (!message.classList.contains('is-collapsed')) return;
+        message.classList.remove('is-collapsed');
+        if (!agentMessages.some(function (item) { return item.classList.contains('is-collapsed'); })) {
+          setAnswersCollapsed(false);
+        }
+      });
+    }
+  });
   document.querySelectorAll('.copy-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var url = btn.getAttribute('data-url');

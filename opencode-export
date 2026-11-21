@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # opencode-export — Export and share OpenCode sessions
 #
-# Reads session data directly from the local OpenCode SQLite database.
+# Session data comes from `opencode session export` when the CLI is available
+# (the stable, documented format), and falls back to reading the local OpenCode
+# SQLite database directly (schema v2 for OpenCode 2.x, v1 for older releases).
 #
 # Subcommands:
 #   list                          List recent local sessions
 #   show <session_id>             Print session as Markdown to stdout
+#   html <session_id> [-o FILE]   Render with the same view as the web GUI
 #   upload <session_id> [-p]      Upload session to share server, print URL
 #                                 -p prompts for a password to protect the page
 #   shares [-s <keyword>] [-n N]  List sessions already shared on the server
@@ -23,9 +26,13 @@
 #   SHARE_TOKEN=your-bearer-token
 #
 # Env:
-#   OPENCODE_DB   override database path (default ~/.local/share/opencode/opencode.db)
+#   OPENCODE_DB             override database path
+#   OPENCODE_EXPORT_SOURCE  auto (default) | cli | db
+#                           auto: try `opencode session export`, fall back to the DB
+#                           cli:  only use the OpenCode CLI
+#                           db:   only read the SQLite database
 #
-# Dependencies: sqlite3, jq, curl
+# Dependencies: sqlite3, jq, curl; the `opencode` CLI is used when present.
 
 set -euo pipefail
 
@@ -37,6 +44,10 @@ Usage:
 
   $(basename "$0") show <session_id>
         Print full session as Markdown to stdout.
+
+  $(basename "$0") html <session_id> [-o <file>]
+        Render the session with the same PHP renderer and template as the web
+        GUI. Writes HTML to stdout unless -o/--output is supplied.
 
   $(basename "$0") upload <session_id> [-p | --password-stdin | --clear-password]
         Upload session to share server (sends JSON, server renders HTML).
@@ -62,7 +73,8 @@ Usage:
         Delete ALL shared sessions from the server (asks for confirmation).
 
 Env:
-  OPENCODE_DB   override database path
+  OPENCODE_DB             override database path
+  OPENCODE_EXPORT_SOURCE  auto (default) | cli | db
 EOF
 }
 
@@ -72,7 +84,22 @@ for arg in "$@"; do
     esac
 done
 
-DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}"
+# ---------- database location ----------
+# OpenCode stores its database under the XDG data dir on Linux and under
+# Application Support on macOS. Pick the first existing candidate.
+default_db() {
+    local candidates=(
+        "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+        "$HOME/Library/Application Support/opencode/opencode.db"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -f "$c" ]]; then printf '%s' "$c"; return; fi
+    done
+    printf '%s' "${candidates[0]}"
+}
+
+DB="${OPENCODE_DB:-$(default_db)}"
 CONFIG_FILE="$HOME/.config/opencode-export/config"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -88,11 +115,26 @@ if [[ -f "$CONFIG_FILE" ]]; then
     set -a; source "$CONFIG_FILE"; set +a
 fi
 
+EXPORT_SOURCE="${OPENCODE_EXPORT_SOURCE:-auto}"
+
+case "$EXPORT_SOURCE" in
+    auto|cli|db) ;;
+    *) die "OPENCODE_EXPORT_SOURCE must be one of: auto, cli, db" ;;
+esac
+
 command -v sqlite3 >/dev/null || die "sqlite3 is required"
 command -v jq      >/dev/null || die "jq is required (brew install jq)"
 command -v curl    >/dev/null || die "curl is required"
 
 need_db() { [[ -f "$DB" ]] || die "database not found: $DB"; }
+
+have_cli() { [[ "$EXPORT_SOURCE" != "db" ]] && command -v opencode >/dev/null 2>&1; }
+
+need_session_source() {
+    if have_cli; then return 0; fi
+    [[ "$EXPORT_SOURCE" == "cli" ]] && die "opencode CLI not found in PATH"
+    need_db
+}
 
 # Temp files are registered here and removed on exit, including on `die`.
 _TMP=()
@@ -106,6 +148,22 @@ sq() { sqlite3 -readonly "$DB" "$@"; }
 sql_escape() { printf '%s' "${1//\'/\'\'}"; }
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Which schema does this database use? v2 is OpenCode 2.x (session_v2 /
+# session_message), v1 is the legacy layout (session / message / part).
+DB_SCHEMA=""
+db_schema() {
+    if [[ -n "$DB_SCHEMA" ]]; then printf '%s' "$DB_SCHEMA"; return; fi
+    [[ -f "$DB" ]] || { printf ''; return; }
+    local t
+    t=$(sq "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session') ORDER BY (name='session_v2') DESC LIMIT 1;")
+    case "$t" in
+        session_v2) DB_SCHEMA=v2 ;;
+        session)    DB_SCHEMA=v1 ;;
+        *)          DB_SCHEMA=unknown ;;
+    esac
+    printf '%s' "$DB_SCHEMA"
+}
 
 need_server() {
     [[ -n "${SHARE_URL:-}"   ]] || die "SHARE_URL not configured (see ~/.config/opencode-export/config)"
@@ -127,6 +185,342 @@ api_call() {
     printf '%s' "$code"
 }
 
+# ---------- canonical session JSON ----------
+# Everything below (show, upload) consumes one normalised shape:
+#
+#   { session_id, title, created_at, updated_at, directory, agent, model,
+#     tokens: {input, output, reasoning, cache_read, cache_write}, cost,
+#     messages: [ {id, time_created, role, model, tokens, cost, finish,
+#                  parts: [ {type: text|reasoning|tool|file|compaction, ...} ]} ] }
+#
+# Three sources feed it: `opencode session export`, the v2 database and the
+# legacy v1 database. All three are first turned into an "export-like"
+# document, so only this one jq program needs to know the canonical shape.
+
+CANON_JQ=$(cat <<'JQ'
+def norm_model:
+  if type == "string" and startswith("{") then (fromjson? // .) else . end;
+
+def part:
+  if .type == "text" then {type:"text", text:(.text // "")}
+  elif .type == "reasoning" then
+    {type:"reasoning",
+     text:(if (.text // "") != "" then .text
+           else ((.state.thinking.thinking // []) | map(.text // "") | join("")) end)}
+  elif .type == "tool" then
+    {type:"tool",
+     tool:(.name // .tool // "unknown"),
+     state:{
+       status:(.state.status // "unknown"),
+       input:(.state.input // null),
+       output:(if (.state.output // null) != null then .state.output
+               elif (.state.content // null) != null then
+                 (.state.content
+                  | map(if type == "string" then .
+                        elif (.type // "") == "text" then (.text // "")
+                        else tojson end)
+                  | join("\n\n"))
+               else null end),
+       error:(if (.state.error // null) == null then null
+              elif (.state.error | type) == "string" then .state.error
+              else (.state.error.message // (.state.error | tojson)) end)
+     }}
+  elif .type == "file" then
+    {type:"file", filename:(.filename // .name // "(unnamed)"), mime:(.mime // ""),
+     url:(.url // .source.uri // "")}
+  elif .type == "compaction" then {type:"compaction", auto:(.auto // false)}
+  elif .type == "step-start" or .type == "step-finish" then empty
+  else . end;
+
+def file_part:
+  {type:"file", filename:(.name // .filename // "(unnamed)"), mime:(.mime // ""),
+   url:(.url // .source.uri // "")};
+
+def message:
+  . as $m
+  | {
+      id: $m.id,
+      time_created: (($m.time.created) // $m.time_created // null),
+      role: (if $m.type == "user" then "user"
+             elif $m.type == "assistant" then "assistant"
+             else "system" end),
+      model: (($m.model // null) | norm_model),
+      tokens: ($m.tokens // null),
+      cost: ($m.cost // null),
+      finish: ($m.finish // null),
+      parts: (
+        if $m.type == "user" then
+          (if ($m.text // "") != "" then [{type:"text", text:$m.text}] else [] end)
+          + (($m.files // []) | map(file_part))
+        elif $m.type == "assistant" then
+          (($m.content // []) | map(part))
+        else
+          (if ($m.text // "") != "" then [{type:"text", text:$m.text}] else [] end)
+        end
+      )
+    };
+
+{
+  session_id: .info.id,
+  title: (.info.title // "(untitled)"),
+  created_at: (.info.time.created // null),
+  updated_at: (.info.time.updated // null),
+  directory: (.info.location.directory // null),
+  agent: (.info.agent // null),
+  model: ((.info.model // null) | norm_model),
+  tokens: {
+    input:       (.info.tokens.input // 0),
+    output:      (.info.tokens.output // 0),
+    reasoning:   (.info.tokens.reasoning // 0),
+    cache_read:  (.info.tokens.cache.read // 0),
+    cache_write: (.info.tokens.cache.write // 0)
+  },
+  cost: (.info.cost // 0),
+  messages: [
+    .messages[]
+    | select(.type == "user" or .type == "assistant"
+             or .type == "system" or .type == "synthetic")
+    | message
+  ]
+}
+JQ
+)
+
+# jq program that renders the canonical shape as Markdown.
+SHOW_JQ=$(cat <<'JQ'
+def fmt_json: tojson | "```json\n" + . + "\n```";
+def ts: if . == null then "" else (./1000 | gmtime | strftime("%Y-%m-%d %H:%M")) end;
+def model_label:
+  if type == "object" then
+    (((.providerID // "") + (if (.providerID // "") != "" and ((.id // .modelID) // "") != "" then "/" else "" end) + ((.id // .modelID) // ""))
+     + (if .variant then " (" + .variant + ")" else "" end))
+  elif type == "string" then .
+  else "" end;
+
+def render_part:
+  if .type == "text" then (.text // "")
+  elif .type == "reasoning" then
+    (if (.text // "") == "" then ""
+     else "\n<details><summary>💭 Reasoning</summary>\n\n" + .text + "\n\n</details>\n" end)
+  elif .type == "tool" then
+    "\n### 🔧 Tool: `" + (.tool // "?") + "` (" + (.state.status // "?") + ")\n"
+    + (if (.state.input // null) != null then "\n**Input:**\n" + (.state.input | fmt_json) else "" end)
+    + (if (.state.output // null) != null then "\n\n**Output:**\n```\n" + (.state.output | tostring) + "\n```" else "" end)
+    + (if (.state.error // null) != null then "\n\n**Error:** " + (.state.error | tostring) else "" end)
+  elif .type == "file" then
+    "\n📎 **Attachment**: `" + (.filename // "(unnamed)") + "` (" + (.mime // "") + ") " + (.url // "")
+  elif .type == "compaction" then
+    "\n---\n\n> 🗜️ **Compaction point** "
+    + (if .auto then "(automatic)" else "(manual /compact)" end)
+    + "\n>\n> _Messages before this point have been compacted into a summary. The full tail follows._\n\n---\n"
+  else
+    "\n<details><summary>⚠️ Unknown part type: `" + (.type // "null") + "`</summary>\n\n"
+    + (tojson | "```json\n" + . + "\n```") + "\n\n</details>\n"
+  end;
+
+def header:
+  (if .role == "user" then "## 🧑 User"
+   elif .role == "assistant" then "## 🤖 Assistant"
+   else "## ⚙️ System" end) as $h
+  | ($h + (if (.model | model_label) != "" then "  ·  " + (.model | model_label) else "" end))
+    + (if .time_created then "\n*" + (.time_created | ts) + "*" else "" end);
+
+def footer:
+  if .role == "assistant" and (.tokens // null) != null then
+    "\n> _tokens: in=" + ((.tokens.input // 0) | tostring)
+    + " out=" + ((.tokens.output // 0) | tostring)
+    + " reasoning=" + ((.tokens.reasoning // 0) | tostring)
+    + (if .cost != null then " · cost=$" + ((.cost * 10000 | round) / 10000 | tostring) else "" end)
+    + (if .finish then " · finish=" + .finish else "" end) + "_"
+  else "" end;
+
+"# " + .title + "\n\n"
++ "- **Session ID**: `" + .session_id + "`\n"
++ (if .created_at then "- **Created**: " + (.created_at | ts) + "\n" else "" end)
++ (if .directory then "- **Directory**: `" + .directory + "`\n" else "" end)
++ (if .agent then "- **Agent**: " + .agent + "\n" else "" end)
++ (if (.model | model_label) != "" then "- **Model**: " + (.model | model_label) + "\n" else "" end)
++ "- **Tokens**: input=" + (.tokens.input | tostring)
++ ", output=" + (.tokens.output | tostring)
++ ", reasoning=" + (.tokens.reasoning | tostring) + "\n"
++ "- **Cost**: $" + (((.cost // 0) * 10000 | round) / 10000 | tostring) + "\n"
++ "\n---"
++ ([ .messages[]
+    | "\n" + ("=" * 80) + "\n" + header + "\n"
+      + ([.parts[] | render_part] | join("\n"))
+      + footer
+  ] | join("\n"))
++ "\n"
+JQ
+)
+
+# Turn a v2 database session into an export-shaped document.
+db_v2_export_like() {
+    local sid="$1" esid; esid=$(sql_escape "$sid")
+    tmp_dir; local d="$TMP_RESULT"
+
+    sq <<SQL > "$d/session.json"
+.mode json
+SELECT id, title, time_created, directory, agent, model, cost,
+       tokens_input, tokens_output, tokens_reasoning,
+       tokens_cache_read, tokens_cache_write
+FROM session_v2 WHERE id='${esid}';
+SQL
+    [[ -s "$d/session.json" ]] || printf '[]' > "$d/session.json"
+
+    sq <<SQL > "$d/messages.json"
+.mode json
+SELECT id, type, seq, time_created, data
+FROM session_message WHERE session_id='${esid}'
+ORDER BY seq;
+SQL
+    [[ -s "$d/messages.json" ]] || printf '[]' > "$d/messages.json"
+
+    jq -n --slurpfile s "$d/session.json" --slurpfile m "$d/messages.json" '
+        ($s[0][0] // null) as $s
+        | if $s == null then error("session not found") else
+        {
+          info: {
+            id: $s.id,
+            title: $s.title,
+            agent: $s.agent,
+            model: ($s.model | if type == "string" and startswith("{") then (fromjson? // .) else . end),
+            cost: ($s.cost // 0),
+            tokens: {
+              input:     ($s.tokens_input // 0),
+              output:    ($s.tokens_output // 0),
+              reasoning: ($s.tokens_reasoning // 0),
+              cache: {
+                read:  ($s.tokens_cache_read // 0),
+                write: ($s.tokens_cache_write // 0)
+              }
+            },
+            time: {created: $s.time_created},
+            location: {directory: $s.directory}
+          },
+          messages: [
+            $m[0][]
+            | (.data | fromjson) as $d
+            | $d + {
+                id: .id,
+                type: .type,
+                time: (($d.time // {}) + {created: (($d.time.created) // .time_created)})
+              }
+          ]
+        } end
+    '
+}
+
+# Turn a legacy (v1) database session into an export-shaped document.
+db_v1_export_like() {
+    local sid="$1" esid; esid=$(sql_escape "$sid")
+    tmp_dir; local d="$TMP_RESULT"
+
+    sq <<SQL > "$d/session.json"
+.mode json
+SELECT id, title, time_created, directory, agent, model, cost,
+       tokens_input, tokens_output, tokens_reasoning
+FROM session WHERE id='${esid}';
+SQL
+    [[ -s "$d/session.json" ]] || printf '[]' > "$d/session.json"
+
+    sq <<SQL > "$d/messages.json"
+.mode json
+SELECT id, time_created, data
+FROM message WHERE session_id='${esid}'
+ORDER BY time_created, id;
+SQL
+    [[ -s "$d/messages.json" ]] || printf '[]' > "$d/messages.json"
+
+    sq <<SQL > "$d/parts.json"
+.mode json
+SELECT id, message_id, time_created, data
+FROM part WHERE session_id='${esid}'
+ORDER BY time_created, id;
+SQL
+    [[ -s "$d/parts.json" ]] || printf '[]' > "$d/parts.json"
+
+    jq -n --slurpfile s "$d/session.json" --slurpfile m "$d/messages.json" --slurpfile p "$d/parts.json" '
+        ($s[0][0] // null) as $s
+        | if $s == null then error("session not found") else
+        ($p[0]
+          | map(. + {parsed: (.data | fromjson)})
+          | group_by(.message_id)
+          | map({key: .[0].message_id, value: (map(.parsed))})
+          | from_entries
+        ) as $byMsg
+        | {
+          info: {
+            id: $s.id,
+            title: $s.title,
+            agent: $s.agent,
+            model: ($s.model | if type == "string" and startswith("{") then (fromjson? // .) else . end),
+            cost: ($s.cost // 0),
+            tokens: {
+              input:     ($s.tokens_input // 0),
+              output:    ($s.tokens_output // 0),
+              reasoning: ($s.tokens_reasoning // 0),
+              cache: {read: 0, write: 0}
+            },
+            time: {created: $s.time_created},
+            location: {directory: $s.directory}
+          },
+          messages: [
+            $m[0][]
+            | (.data | fromjson) as $d
+            | {
+                id: .id,
+                type: $d.role,
+                time: {created: .time_created},
+                model: ($d.model // (
+                  if ($d.providerID // $d.modelID) then
+                    {providerID: $d.providerID, id: $d.modelID}
+                  else null end)),
+                tokens: ($d.tokens // null),
+                cost: ($d.cost // null),
+                finish: ($d.finish // null),
+                content: ($byMsg[.id] // [])
+              }
+          ]
+        } end
+    '
+}
+
+# Print the canonical JSON for a session.
+canonical_json() {
+    local sid="$1"
+    tmp_dir; local d="$TMP_RESULT"
+
+    if have_cli; then
+        if opencode session export "$sid" > "$d/export.json" 2>"$d/export.err" \
+           && [[ -s "$d/export.json" ]] \
+           && jq -e '.info and (.messages | type == "array")' "$d/export.json" >/dev/null 2>&1; then
+            jq "$CANON_JQ" "$d/export.json" && return 0
+        fi
+        if [[ "$EXPORT_SOURCE" == "cli" ]]; then
+            [[ -s "$d/export.err" ]] && cat "$d/export.err" >&2
+            die "opencode session export failed for: $sid"
+        fi
+    fi
+
+    need_db
+    local schema table esid exists
+    schema=$(db_schema)
+    case "$schema" in
+        v2) table=session_v2 ;;
+        v1) table=session ;;
+        *)  die "unrecognised OpenCode database schema in: $DB" ;;
+    esac
+    esid=$(sql_escape "$sid")
+    exists=$(sq "SELECT COUNT(*) FROM $table WHERE id='${esid}';")
+    [[ "$exists" -gt 0 ]] || die "session not found: $sid"
+
+    case "$schema" in
+        v2) db_v2_export_like "$sid" | jq "$CANON_JQ" ;;
+        v1) db_v1_export_like "$sid" | jq "$CANON_JQ" ;;
+    esac
+}
+
 # ---------- list ----------
 cmd_list() {
     need_db
@@ -140,6 +534,13 @@ cmd_list() {
     done
     is_uint "$limit" || die "-n expects a number"
 
+    local table
+    case "$(db_schema)" in
+        v2) table=session_v2 ;;
+        v1) table=session ;;
+        *)  die "unrecognised OpenCode database schema in: $DB" ;;
+    esac
+
     local where=""
     if [[ -n "$search" ]]; then
         where="WHERE title LIKE '%$(sql_escape "$search")%'"
@@ -151,7 +552,7 @@ SELECT
     id,
     datetime(time_created/1000, 'unixepoch', 'localtime'),
     title
-FROM session
+FROM ${table}
 ${where}
 ORDER BY time_created DESC
 LIMIT ${limit};
@@ -159,113 +560,40 @@ SQL
 }
 
 # ---------- show (markdown to stdout) ----------
-render_part_md() {
-    jq -r '
-        def code(lang): "```" + (lang // "") + "\n" + . + "\n```";
-        def fmt_json: tojson | code("json");
-
-        if   .type == "text"        then .text
-        elif .type == "reasoning"   then
-            if (.text // "") == "" then ""
-            else "\n<details><summary>💭 Reasoning</summary>\n\n" + .text + "\n\n</details>\n"
-            end
-        elif .type == "tool"        then
-            "\n### 🔧 Tool: `" + (.tool // "?") + "` (" + (.state.status // "?") + ")\n"
-            + (if .state.input  then "\n**Input:**\n"  + (.state.input | fmt_json)                else "" end)
-            + (if .state.output then "\n\n**Output:**\n```\n" + (.state.output | tostring) + "\n```" else "" end)
-            + (if .state.error  then "\n\n**Error:** " + (.state.error | tostring)               else "" end)
-        elif .type == "file"        then
-            "\n📎 **Attachment**: `" + (.filename // .name // "(unnamed)") + "` "
-            + "(" + (.mime // "") + ") " + (.url // "")
-        elif .type == "step-start"  then ""
-        elif .type == "step-finish" then ""
-        elif .type == "compaction"  then
-            "\n---\n\n> 🗜️ **Compaction point** "
-            + (if .auto then "(automatic)" else "(manual /compact)" end)
-            + (if .tail_start_id then " · tail start: `" + .tail_start_id + "`" else "" end)
-            + "\n>\n> _Messages before this point have been compacted into a summary. The full tail follows._\n\n---\n"
-        else
-            "\n<details><summary>⚠️ Unknown part type: `" + (.type // "null") + "`</summary>\n\n"
-            + (. | tojson | code("json")) + "\n\n</details>\n"
-        end
-    '
-}
-
 cmd_show() {
-    need_db
     local sid="${1:-}"
     [[ -n "$sid" ]] || die "usage: show <session_id>"
-    local esid; esid=$(sql_escape "$sid")
-    local exists; exists=$(sq "SELECT COUNT(*) FROM session WHERE id='${esid}';")
-    [[ "$exists" -gt 0 ]] || die "session not found: $sid"
+    need_session_source
+    canonical_json "$sid" | jq -r "$SHOW_JQ"
+}
 
-    sq <<SQL | jq -r '.[0] |
-        (.model | if type == "string" and startswith("{") then (fromjson? // .) else . end) as $m
-        | (if ($m | type) == "object"
-             then (($m.providerID // "") + "/" + ($m.modelID // $m.id // ""))
-                  + (if $m.variant then " (" + $m.variant + ")" else "" end)
-             else $m end) as $model
-        | "# " + .title + "\n\n"
-        + "- **Session ID**: `" + .id + "`\n"
-        + "- **Created**: " + (.created // "") + "\n"
-        + (if .directory then "- **Directory**: `" + .directory + "`\n" else "" end)
-        + (if .agent     then "- **Agent**: "     + .agent     + "\n" else "" end)
-        + (if $model     then "- **Model**: "     + $model     + "\n" else "" end)
-        + "- **Tokens**: input=" + (.tokens_input|tostring)
-        + ", output=" + (.tokens_output|tostring)
-        + ", cost=$" + (.cost | . * 10000 | round / 10000 | tostring)
-        + "\n\n---"
-    '
-.mode json
-SELECT
-    id, title,
-    datetime(time_created/1000, 'unixepoch', 'localtime') AS created,
-    directory, agent, model, cost, tokens_input, tokens_output
-FROM session WHERE id='${esid}';
-SQL
+# ---------- html (same renderer/template as the web GUI) ----------
+cmd_html() {
+    local sid="" output="" target="/dev/stdout"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|--output) [[ $# -ge 2 && -n "$2" ]] || die "-o expects a file path"; output="$2"; shift 2 ;;
+            -*) die "unknown option to html: $1" ;;
+            *) [[ -z "$sid" ]] || die "unexpected argument: $1"; sid="$1"; shift ;;
+        esac
+    done
+    [[ -n "$sid" ]] || die "usage: html <session_id> [-o <file>]"
+    command -v php >/dev/null || die "php is required for HTML export"
 
-    local mids
-    mids=$(sq "SELECT id FROM message WHERE session_id='${esid}' ORDER BY time_created, id;")
+    tmp_dir
+    local d="$TMP_RESULT" script_dir renderer
+    canonical_json "$sid" > "$d/session.json"
 
-    while IFS= read -r mid; do
-        [[ -z "$mid" ]] && continue
-        local emid; emid=$(sql_escape "$mid")
-        local mdata mtime
-        mdata=$(sq "SELECT data FROM message WHERE id='${emid}';")
-        mtime=$(sq "SELECT datetime(time_created/1000, 'unixepoch', 'localtime') FROM message WHERE id='${emid}';")
+    # Use the same render_session() implementation and session.php template as
+    # /s/<slug>. OPENCODE_EXPORT_ROOT supports split client/server installs.
+    script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    renderer="${OPENCODE_EXPORT_ROOT:-$script_dir}/server/app/render-cli.php"
+    [[ -f "$renderer" ]] || die "web renderer not found: $renderer (set OPENCODE_EXPORT_ROOT to the project root)"
 
-        local header
-        header=$(echo "$mdata" | jq -r --arg t "$mtime" '
-            (if .role == "user" then "## 🧑 User" else "## 🤖 Assistant" end) as $h
-            | (.model // {providerID: .providerID, modelID: .modelID}) as $m
-            | (if ($m.modelID // null) != null
-                then $h + "  ·  " + ($m.providerID // "?") + "/" + $m.modelID
-                else $h end)
-            + "\n*" + $t + "*\n"
-        ')
+    [[ -z "$output" ]] || { mkdir -p "$(dirname "$output")"; target="$output"; }
+    php "$renderer" "$d/session.json" > "$target"
 
-        echo
-        echo '================================================================================'
-        echo "$header"
-
-        sq "SELECT data FROM part WHERE message_id='${emid}' ORDER BY time_created, id;" \
-            | while IFS= read -r pdata; do
-                [[ -z "$pdata" ]] && continue
-                echo "$pdata" | render_part_md
-                echo
-            done
-
-        echo "$mdata" | jq -r '
-            if .role == "assistant" then
-                "\n> _tokens: in=" + ((.tokens.input // 0)|tostring)
-                + " out=" + ((.tokens.output // 0)|tostring)
-                + " reasoning=" + ((.tokens.reasoning // 0)|tostring)
-                + (if .cost != null then " · cost=$" + (.cost | . * 10000 | round / 10000 | tostring) else "" end)
-                + (if .finish then " · finish=" + .finish else "" end)
-                + "_"
-            else empty end
-        '
-    done <<< "$mids"
+    [[ -z "$output" ]] || echo "✓ exported web-view HTML: $output" >&2
 }
 
 # Collect a share password into $2 according to mode $1 (prompt|stdin|clear).
@@ -309,85 +637,8 @@ slug_from_arg() {
 # ---------- upload (JSON payload, server renders HTML) ----------
 build_payload() {
     local sid="$1"
-    local esid; esid=$(sql_escape "$sid")
-
-    tmp_dir; local tmpdir="$TMP_RESULT"
-
-    sq <<SQL | jq '.[0] // null' > "$tmpdir/session.json"
-.mode json
-SELECT
-    id, title, time_created,
-    directory, agent, model, cost, tokens_input, tokens_output, tokens_reasoning
-FROM session WHERE id='${esid}';
-SQL
-    [[ -s "$tmpdir/session.json" && "$(cat "$tmpdir/session.json")" != "null" ]] || die "session not found: $sid"
-
-    sq <<SQL > "$tmpdir/messages.json"
-.mode json
-SELECT id, session_id, time_created, data
-FROM message WHERE session_id='${esid}'
-ORDER BY time_created, id;
-SQL
-    [[ ! -s "$tmpdir/messages.json" ]] && printf '[]' > "$tmpdir/messages.json"
-
-    sq <<SQL > "$tmpdir/parts.json"
-.mode json
-SELECT id, message_id, time_created, data
-FROM part WHERE session_id='${esid}'
-ORDER BY time_created, id;
-SQL
-    [[ ! -s "$tmpdir/parts.json" ]] && printf '[]' > "$tmpdir/parts.json"
-
-    # --slurpfile wraps each file in an array, so use [0] to unwrap
-    jq -n \
-        --slurpfile session  "$tmpdir/session.json" \
-        --slurpfile messages "$tmpdir/messages.json" \
-        --slurpfile parts    "$tmpdir/parts.json" '
-        ($session[0])  as $session  |
-        ($messages[0]) as $messages |
-        ($parts[0])    as $parts    |
-        ($parts
-            | map(. + {parsed: (.data | fromjson)})
-            | group_by(.message_id)
-            | map({key: .[0].message_id, value: (map(.parsed))})
-            | from_entries
-        ) as $partsByMsg
-        |
-        {
-            session_id:  $session.id,
-            title:       $session.title,
-            created_at:  $session.time_created,
-            directory:   $session.directory,
-            agent:       $session.agent,
-            model:       ($session.model
-                          | if type == "string" and startswith("{") then (fromjson? // .) else . end),
-            tokens: {
-                input:     ($session.tokens_input     // 0),
-                output:    ($session.tokens_output    // 0),
-                reasoning: ($session.tokens_reasoning // 0)
-            },
-            cost: ($session.cost // 0),
-            messages: (
-                $messages | map(
-                    (.data | fromjson) as $d
-                    | {
-                        id:           .id,
-                        time_created: .time_created,
-                        role:         $d.role,
-                        model:        ($d.model // (
-                            if ($d.providerID // $d.modelID) then
-                              {providerID: $d.providerID, modelID: $d.modelID}
-                            else null end
-                        )),
-                        tokens: $d.tokens,
-                        cost:   $d.cost,
-                        finish: $d.finish,
-                        parts:  ($partsByMsg[.id] // [])
-                    }
-                )
-            )
-        }
-    '
+    need_session_source
+    canonical_json "$sid"
 }
 
 cmd_upload() {
@@ -402,7 +653,6 @@ cmd_upload() {
         esac
     done
     [[ -n "$sid" ]] || die "usage: upload <session_id> [-p | --password-stdin | --clear-password]"
-    need_db
     need_server
 
     tmp_dir; local tmpdir="$TMP_RESULT"
@@ -614,6 +864,7 @@ sub="$1"; shift
 case "$sub" in
     list)             cmd_list "$@" ;;
     show)             cmd_show "$@" ;;
+    html)             cmd_html "$@" ;;
     upload)           cmd_upload "$@" ;;
     shares)           cmd_shares "$@" ;;
     purge)            cmd_purge  "$@" ;;

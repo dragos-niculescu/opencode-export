@@ -1,10 +1,10 @@
 # opencode-export
 
-Export and share [OpenCode](https://opencode.ai) sessions — because the official export is incomplete and sharing requires a paid plan.
+Export and share [OpenCode](https://opencode.ai) sessions — because the official export is a raw JSON dump and sharing requires a paid plan.
 
 This project has two parts:
 
-- **`opencode-export`** — a Bash client that reads your local OpenCode SQLite database and uploads sessions to your own server.
+- **`opencode-export`** — a Bash client that exports sessions from your local OpenCode install and uploads them to your own server. It uses `opencode session export` when the CLI is available and otherwise reads the OpenCode SQLite database directly (OpenCode 2.x schema and the legacy schema).
 - **`server/`** — a self-hosted PHP application that stores and renders shared sessions as clean, readable HTML pages.
 
 ## Screenshots
@@ -18,6 +18,7 @@ This project has two parts:
 ## Features
 
 - Full session export — including tool calls, reasoning blocks, compaction points, and token/cost metadata
+- Works with current OpenCode (2.x) through the official export format, with a direct database fallback for older releases
 - Clean HTML rendering with syntax highlighting; dark mode follows the system, with a manual light/dark toggle on every page (remembered per browser)
 - Paginated session view for long conversations
 - **Raw JSON endpoint** — append `/raw` to any share URL (e.g. `https://share.example.com/s/AbCdEf/raw`) to get machine-readable output, ideal for feeding sessions to AI assistants
@@ -39,6 +40,7 @@ This project has two parts:
 ### Client (`opencode-export`)
 - macOS or Linux
 - `sqlite3`, `jq`, `curl`
+- the `opencode` CLI (recommended — used for `show`/`upload`; without it the client reads the SQLite database directly)
 
 ---
 
@@ -185,6 +187,17 @@ opencode-export list -n 50          # show more results
 opencode-export show <session_id>
 ```
 
+### Export the browser view as HTML
+
+The `html` command uses the same PHP renderer, session template, theme, Markdown handling, tool and reasoning blocks, and syntax highlighting as the web GUI. Unlike the paginated web page, the exported file contains every message:
+
+```bash
+opencode-export html <session_id> -o session.html
+opencode-export html <session_id> > session.html
+```
+
+PHP 8.1 or newer is required. The client locates `server/app/render-cli.php` relative to the `opencode-export` executable. If the client and server files are installed separately, set `OPENCODE_EXPORT_ROOT` to the project root. The page references the same highlight.js CDN assets as the web GUI, so syntax highlighting requires network access when the file is opened.
+
 ### Upload a session
 
 ```bash
@@ -223,9 +236,26 @@ opencode-export purge               # delete ALL shared sessions
 
 ### Override the database path
 
+The client auto-detects the database (`~/.local/share/opencode/opencode.db`, or `~/Library/Application Support/opencode/opencode.db` on macOS). Override it when needed:
+
 ```bash
 OPENCODE_DB=/custom/path/opencode.db opencode-export list
 ```
+
+### Choose where session data comes from
+
+`show` and `upload` prefer `opencode session export` (the stable, documented JSON format) and fall back to reading the database. Force one source with:
+
+```bash
+OPENCODE_EXPORT_SOURCE=cli opencode-export show <session_id>
+OPENCODE_EXPORT_SOURCE=db  opencode-export show <session_id>   # skip the CLI
+```
+
+`list` always reads the database, because the CLI only lists sessions of the current project.
+
+### Compatibility
+
+Tested with OpenCode 2.3 (database schema v2: `session_v2`, `session_message`, inline message parts). The legacy schema (`session`, `message`, `part`) is still supported for older OpenCode releases, so a single client works against both.
 
 ### Redact a shared session (admin page)
 

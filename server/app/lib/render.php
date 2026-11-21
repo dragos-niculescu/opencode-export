@@ -17,7 +17,9 @@ function render_session(array $cfg, array $row, int $page = 1, bool $edit = fals
     $nonce = security_nonce();
     $base  = rtrim((string)$cfg['PUBLIC_BASE_URL'], '/');
 
-    $per_page   = 20;
+    // Browser shares use 20 messages per page. Static exports override this
+    // so one HTML file contains the entire conversation.
+    $per_page   = max(1, (int)($cfg["SESSION_PAGE_SIZE"] ?? 20));
     $all_msgs   = is_array($payload['messages'] ?? null) ? $payload['messages'] : [];
     $total_msgs = count($all_msgs);
     $pages      = max(1, (int)ceil($total_msgs / $per_page));
@@ -65,6 +67,14 @@ function render_part(array $part, Parsedown $pd): string {
                 <span class="compaction-label">Context compacted (' . $auto . ') — content before this point has been replaced with a summary</span>
             </div>';
 
+        case 'note':
+        case 'system':
+            $text = is_string($part['text'] ?? null) ? $part['text'] : '';
+            if ($text === '') {
+                return '';
+            }
+            return '<div class="part-note">' . h($text) . '</div>';
+
         default:
             $json = h(json_encode($part, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR));
             return '<details class="part-unknown">
@@ -75,7 +85,9 @@ function render_part(array $part, Parsedown $pd): string {
 }
 
 function render_tool(array $part): string {
-    $tool   = h(is_string($part['tool'] ?? null) ? $part['tool'] : 'unknown');
+    $name   = is_string($part['tool'] ?? null) ? $part['tool']
+            : (is_string($part['name'] ?? null) ? $part['name'] : 'unknown');
+    $tool   = h($name);
     $state  = is_array($part['state'] ?? null) ? $part['state'] : [];
     $status = h(is_string($state['status'] ?? null) ? $state['status'] : 'unknown');
 
@@ -84,6 +96,28 @@ function render_tool(array $part): string {
         'error'     => 'status-error',
         default     => 'status-pending',
     };
+
+    // Older clients store the result in state.output; current OpenCode keeps it
+    // as an array of content parts in state.content.
+    $output = $state['output'] ?? null;
+    if (($output === null || $output === '') && is_array($state['content'] ?? null)) {
+        $chunks = [];
+        foreach ($state['content'] as $c) {
+            if (is_string($c)) {
+                $chunks[] = $c;
+            } elseif (is_array($c) && is_string($c['text'] ?? null)) {
+                $chunks[] = $c['text'];
+            } elseif (is_array($c)) {
+                $chunks[] = (string)json_encode($c, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            }
+        }
+        $output = implode("\n\n", $chunks);
+    }
+
+    $error = $state['error'] ?? null;
+    if (is_array($error)) {
+        $error = $error['message'] ?? json_encode($error, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+    }
 
     $html = '<div class="part-tool ' . $statusClass . '">';
     $html .= '<div class="tool-header"><span class="tool-name">&#x1F527; ' . $tool . '</span> <span class="tool-status">' . $status . '</span></div>';
@@ -95,14 +129,14 @@ function render_tool(array $part): string {
         $html .= '<details class="tool-section" open><summary>Input</summary><pre class="tool-input"><code class="language-json">' . $inputJson . '</code></pre></details>';
     }
 
-    if (isset($state['output']) && $state['output'] !== '') {
-        $output = h(is_scalar($state['output']) ? $state['output'] : json_encode($state['output'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-        $html .= '<details class="tool-section" open><summary>Output</summary><pre class="tool-output"><code>' . $output . '</code></pre></details>';
+    if ($output !== null && $output !== '') {
+        $outputHtml = h(is_scalar($output) ? (string)$output : (string)json_encode($output, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR));
+        $html .= '<details class="tool-section" open><summary>Output</summary><pre class="tool-output"><code>' . $outputHtml . '</code></pre></details>';
     }
 
-    if (isset($state['error']) && $state['error'] !== '') {
-        $error = h(is_scalar($state['error']) ? $state['error'] : json_encode($state['error'], JSON_UNESCAPED_UNICODE));
-        $html .= '<div class="tool-error"><strong>Error:</strong> ' . $error . '</div>';
+    if ($error !== null && $error !== '') {
+        $errorHtml = h(is_scalar($error) ? (string)$error : (string)json_encode($error, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR));
+        $html .= '<div class="tool-error"><strong>Error:</strong> ' . $errorHtml . '</div>';
     }
 
     $html .= '</div>';
