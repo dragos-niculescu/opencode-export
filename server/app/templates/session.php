@@ -121,7 +121,8 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
 .collapse-toggle:hover { background: var(--bg-alt); }
 .message.role-assistant .msg-body { display: block; }
 .message.role-assistant.is-collapsed .msg-body { display: none; }
-.message.role-assistant.is-collapsed .msg-header { margin-bottom: 0; cursor: pointer; }
+.message.role-assistant.is-collapsed .msg-header { margin-bottom: 0; }
+.message.role-assistant.is-group-hidden { display: none; }
 @media print { .collapse-toggle { display: none; } }
 
 /* ---- Messages ---- */
@@ -148,11 +149,16 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monosp
 .role-badge {
   font-weight: 700;
   font-size: .8rem;
+  font-family: inherit;
   text-transform: uppercase;
   letter-spacing: .04em;
   padding: .15rem .5rem;
+  border: 0;
   border-radius: 4px;
 }
+button.role-badge { cursor: pointer; }
+button.role-badge:hover { filter: brightness(1.12); }
+button.role-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .role-user      .role-badge { background: var(--accent); color: #fff; }
 .role-assistant .role-badge { background: #555; color: #fff; }
 .role-system    .role-badge { background: #777; color: #fff; }
@@ -523,7 +529,12 @@ dialog .link { font-family: monospace; word-break: break-all; }
     ?>
     <div class="message <?= $roleClass ?>" id="message-<?= $mi ?>" data-mi="<?= $mi ?>">
       <div class="msg-header">
+        <?php if ($role === 'user' || $role === 'assistant'): ?>
+        <button type="button" class="role-badge" aria-expanded="true"
+                title="<?= $role === 'user' ? 'Collapse or expand all answers for this question' : 'Collapse or expand this answer' ?>"><?= h($role) ?></button>
+        <?php else: ?>
         <span class="role-badge"><?= h($role) ?></span>
+        <?php endif; ?>
         <?php if ($modelStr): ?>
         <span class="msg-model"><?= h($modelStr) ?></span>
         <?php endif; ?>
@@ -739,39 +750,107 @@ document.addEventListener('DOMContentLoaded', function () {
 
   var collapseButton = document.getElementById('collapse-toggle');
   var agentMessages = Array.prototype.slice.call(document.querySelectorAll('.message.role-assistant'));
-  var answersCollapsed = false;
+  var userMessages = Array.prototype.slice.call(document.querySelectorAll('.message.role-user'));
+  var globalPhase = 0;
 
-  function setAnswersCollapsed(collapsed) {
-    answersCollapsed = collapsed;
-    agentMessages.forEach(function (message) {
+  // A user question cycles through four phases:
+  // 0 hidden -> 1 visible/collapsed -> 2 visible/expanded
+  // -> 3 visible/collapsed -> 0 hidden.
+  function answersForUser(userMessage) {
+    var answers = [];
+    var message = userMessage.nextElementSibling;
+    while (message) {
+      if (message.classList.contains('role-user')) break;
+      if (message.classList.contains('role-assistant')) answers.push(message);
+      message = message.nextElementSibling;
+    }
+    return answers;
+  }
+
+  function applyGroupPhase(userMessage, phase) {
+    var group = answersForUser(userMessage);
+    var hidden = phase === 0;
+    var collapsed = phase !== 2;
+
+    userMessage.dataset.answerPhase = String(phase);
+    group.forEach(function (message) {
+      message.classList.toggle('is-group-hidden', hidden);
       message.classList.toggle('is-collapsed', collapsed);
+      var assistantBadge = message.querySelector('.role-badge');
+      if (assistantBadge) {
+        assistantBadge.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      }
     });
-    if (collapseButton) {
-      collapseButton.textContent = collapsed ? 'Expand answers' : 'Collapse answers';
-      collapseButton.title = collapsed ? 'Expand all agent answers' : 'Collapse all agent answers';
-      collapseButton.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+
+    var userBadge = userMessage.querySelector('.role-badge');
+    if (userBadge) {
+      userBadge.disabled = group.length === 0;
+      userBadge.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+      userBadge.title =
+        phase === 0 ? 'Show collapsed answers for this question' :
+        phase === 1 ? 'Expand all answers for this question' :
+        phase === 2 ? 'Collapse all answers for this question' :
+                      'Hide all answers for this question';
     }
   }
+
+  function phaseLabel(phase) {
+    return phase === 0 ? 'Show answers' :
+           phase === 1 ? 'Expand answers' :
+           phase === 2 ? 'Collapse answers' :
+                         'Hide answers';
+  }
+
+  function updateGlobalControl() {
+    if (!collapseButton) return;
+    collapseButton.hidden = agentMessages.length === 0;
+    collapseButton.textContent = phaseLabel(globalPhase);
+    collapseButton.title = phaseLabel(globalPhase) + ' for all questions';
+    collapseButton.setAttribute('aria-pressed', globalPhase === 0 ? 'false' : 'true');
+  }
+
+  // Initial state: only user questions are visible.
+  agentMessages.forEach(function (message) {
+    message.classList.add('is-group-hidden', 'is-collapsed');
+  });
+  userMessages.forEach(function (userMessage) {
+    applyGroupPhase(userMessage, 0);
+  });
+  updateGlobalControl();
 
   if (collapseButton) {
-    collapseButton.hidden = agentMessages.length === 0;
     collapseButton.addEventListener('click', function () {
-      setAnswersCollapsed(!answersCollapsed);
+      globalPhase = (globalPhase + 1) % 4;
+      userMessages.forEach(function (userMessage) {
+        applyGroupPhase(userMessage, globalPhase);
+      });
+      updateGlobalControl();
     });
   }
 
+  // ASSISTANT toggles only its own body while its group is visible.
   agentMessages.forEach(function (message) {
-    var header = message.querySelector('.msg-header');
-    if (header) {
-      header.addEventListener('click', function () {
-        if (!message.classList.contains('is-collapsed')) return;
-        message.classList.remove('is-collapsed');
-        if (!agentMessages.some(function (item) { return item.classList.contains('is-collapsed'); })) {
-          setAnswersCollapsed(false);
-        }
-      });
-    }
+    var badge = message.querySelector('.role-badge');
+    if (!badge) return;
+    badge.addEventListener('click', function () {
+      message.classList.toggle('is-collapsed');
+      badge.setAttribute(
+        'aria-expanded',
+        message.classList.contains('is-collapsed') ? 'false' : 'true'
+      );
+    });
   });
+
+  // USER advances independently through the requested four-click sequence.
+  userMessages.forEach(function (userMessage) {
+    var badge = userMessage.querySelector('.role-badge');
+    if (!badge || badge.disabled) return;
+    badge.addEventListener('click', function () {
+      var phase = Number(userMessage.dataset.answerPhase || 0);
+      applyGroupPhase(userMessage, (phase + 1) % 4);
+    });
+  });
+
   document.querySelectorAll('.copy-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var url = btn.getAttribute('data-url');
