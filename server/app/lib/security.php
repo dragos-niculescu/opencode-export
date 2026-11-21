@@ -45,6 +45,7 @@ function security_headers(): void {
         . "script-src 'nonce-{$nonce}' https://cdnjs.cloudflare.com; "
         . "style-src 'nonce-{$nonce}' https://cdnjs.cloudflare.com; "
         . "img-src 'self' data: https:; "
+        . "frame-src data:; "
         . "connect-src 'self'; "
         . "form-action 'self'; "
         . "base-uri 'none'; "

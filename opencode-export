@@ -8,7 +8,8 @@
 # Subcommands:
 #   list                          List recent local sessions
 #   show <session_id>             Print session as Markdown to stdout
-#   html <session_id> [-o FILE]   Render with the same view as the web GUI
+#   html <session_id> [-o FILE] [--with-attachments]
+#                                  Render with the same view as the web GUI
 #   upload <session_id> [-p]      Upload session to share server, print URL
 #                                 -p prompts for a password to protect the page
 #   shares [-s <keyword>] [-n N]  List sessions already shared on the server
@@ -45,9 +46,10 @@ Usage:
   $(basename "$0") show <session_id>
         Print full session as Markdown to stdout.
 
-  $(basename "$0") html <session_id> [-o <file>]
+  $(basename "$0") html <session_id> [-o <file>] [--with-attachments]
         Render the session with the same PHP renderer and template as the web
         GUI. Writes HTML to stdout unless -o/--output is supplied.
+        Embed attached files only when --with-attachments is supplied.
 
   $(basename "$0") upload <session_id> [-p | --password-stdin | --clear-password]
         Upload session to share server (sends JSON, server renders HTML).
@@ -227,14 +229,14 @@ def part:
      }}
   elif .type == "file" then
     {type:"file", filename:(.filename // .name // "(unnamed)"), mime:(.mime // ""),
-     url:(.url // .source.uri // "")}
+     url:(.url // .source.uri // ""), data:(if (.data // null) == null then null elif (.data | startswith("data:")) then .data else "data:" + (.mime // "application/octet-stream") + ";base64," + .data end)}
   elif .type == "compaction" then {type:"compaction", auto:(.auto // false)}
   elif .type == "step-start" or .type == "step-finish" then empty
   else . end;
 
 def file_part:
   {type:"file", filename:(.name // .filename // "(unnamed)"), mime:(.mime // ""),
-   url:(.url // .source.uri // "")};
+   url:(.url // .source.uri // ""), data:(if (.data // null) == null then null elif (.data | startswith("data:")) then .data else "data:" + (.mime // "application/octet-stream") + ";base64," + .data end)};
 
 def message:
   . as $m
@@ -569,15 +571,16 @@ cmd_show() {
 
 # ---------- html (same renderer/template as the web GUI) ----------
 cmd_html() {
-    local sid="" output="" target="/dev/stdout"
+    local sid="" output="" target="/dev/stdout" with_attachments=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -o|--output) [[ $# -ge 2 && -n "$2" ]] || die "-o expects a file path"; output="$2"; shift 2 ;;
+            --with-attachments) with_attachments=1; shift ;;
             -*) die "unknown option to html: $1" ;;
             *) [[ -z "$sid" ]] || die "unexpected argument: $1"; sid="$1"; shift ;;
         esac
     done
-    [[ -n "$sid" ]] || die "usage: html <session_id> [-o <file>]"
+    [[ -n "$sid" ]] || die "usage: html <session_id> [-o <file>] [--with-attachments]"
     command -v php >/dev/null || die "php is required for HTML export"
 
     tmp_dir
@@ -591,7 +594,11 @@ cmd_html() {
     [[ -f "$renderer" ]] || die "web renderer not found: $renderer (set OPENCODE_EXPORT_ROOT to the project root)"
 
     [[ -z "$output" ]] || { mkdir -p "$(dirname "$output")"; target="$output"; }
-    php "$renderer" "$d/session.json" > "$target"
+    if [[ "$with_attachments" -eq 1 ]]; then
+        php "$renderer" "$d/session.json" --with-attachments > "$target"
+    else
+        php "$renderer" "$d/session.json" > "$target"
+    fi
 
     [[ -z "$output" ]] || echo "✓ exported web-view HTML: $output" >&2
 }

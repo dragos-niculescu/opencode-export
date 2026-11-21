@@ -144,15 +144,63 @@ function render_tool(array $part): string {
 }
 
 function render_file_part(array $part): string {
-    $filename = h(is_string($part['filename'] ?? null) ? $part['filename'] : 'file');
-    $mime     = h(is_string($part['mime'] ?? null) ? $part['mime'] : '');
-    $url      = is_string($part['url'] ?? null) ? $part['url'] : '';
+    $filenameRaw = is_string($part['filename'] ?? null) ? $part['filename'] : 'file';
+    $mimeRaw     = is_string($part['mime'] ?? null) ? strtolower(trim($part['mime'])) : '';
+    $url         = is_string($part['url'] ?? null) ? $part['url'] : '';
+    $data        = is_string($part['data'] ?? null) ? $part['data'] : '';
 
-    $html = '<div class="part-file">&#x1F4CE; <strong>' . $filename . '</strong>';
-    if ($mime) {
-        $html .= ' <span class="file-mime">(' . $mime . ')</span>';
+    $filename = h($filenameRaw);
+    $mime     = h($mimeRaw);
+    $embedded = '';
+
+    // Accept only base64 data URLs whose declared type matches the attachment.
+    // This excludes javascript: URLs and malformed data supplied in share JSON.
+    if ($data !== '' &&
+        preg_match('#^data:([a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*);base64,([A-Za-z0-9+/=\r\n]+)$#i', $data, $m) &&
+        ($mimeRaw === '' || hash_equals($mimeRaw, strtolower($m[1])))) {
+        $mimeRaw = strtolower($m[1]);
+        $mime = h($mimeRaw);
+        $embedded = $data;
     }
-    if ($url) {
+
+    $label = '&#x1F4CE; <strong>' . $filename . '</strong>';
+    if ($mime !== '') {
+        $label .= ' <span class="file-mime">(' . $mime . ')</span>';
+    }
+
+    if ($embedded !== '') {
+        $safeData = h($embedded);
+        $isImage = str_starts_with($mimeRaw, 'image/');
+        $isHtml  = in_array($mimeRaw, ['text/html', 'application/xhtml+xml'], true);
+
+        $html = '<details class="part-file attachment-embedded">';
+        $html .= '<summary>' . $label . ' <span class="attachment-hint">embedded</span></summary>';
+        $html .= '<div class="attachment-actions">';
+        $html .= '<a href="' . $safeData . '" download="' . $filename . '">Download</a>';
+        if ($isHtml) {
+            $html .= ' <a href="' . $safeData . '" target="_blank" rel="noopener noreferrer">Open in new tab</a>';
+        }
+        $html .= '</div>';
+
+        if ($isImage) {
+            $html .= '<a class="attachment-image-link" href="' . $safeData . '" target="_blank" rel="noopener noreferrer">';
+            $html .= '<img class="attachment-image" src="' . $safeData . '" alt="' . $filename . '" loading="lazy">';
+            $html .= '</a>';
+        } elseif ($isHtml) {
+            // No allow-same-origin: embedded scripts can run, but the attachment
+            // remains in an opaque origin and cannot reach the conversation DOM.
+            $html .= '<iframe class="attachment-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups"';
+            $html .= ' src="' . $safeData . '" title="' . $filename . '" loading="lazy"></iframe>';
+        } else {
+            $html .= '<div class="attachment-note">Preview is not available for this file type.</div>';
+        }
+
+        $html .= '</details>';
+        return $html;
+    }
+
+    $html = '<div class="part-file">' . $label;
+    if ($url !== '') {
         if (preg_match('#^https?://#i', $url)) {
             $html .= ' <a href="' . h($url) . '" target="_blank" rel="noopener noreferrer">Open</a>';
         } else {

@@ -274,6 +274,49 @@ button.role-badge:focus-visible { outline: 2px solid var(--accent); outline-offs
   margin: .4rem 0;
 }
 .file-mime { color: var(--text-muted); }
+.part-file summary { cursor: pointer; overflow-wrap: anywhere; }
+.part-file summary::marker { color: var(--text-muted); }
+.attachment-hint {
+  display: inline-block;
+  margin-left: .35rem;
+  padding: .05rem .4rem;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--text-muted);
+  font-size: .72rem;
+}
+.attachment-actions {
+  display: flex;
+  gap: .75rem;
+  padding: .65rem 0 .5rem;
+}
+.attachment-image-link { display: block; }
+.attachment-image {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  margin: .25rem auto;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.attachment-frame {
+  display: block;
+  width: 100%;
+  min-height: 500px;
+  height: 70vh;
+  margin-top: .25rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+}
+.attachment-note {
+  padding: .75rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+@media (max-width: 600px) {
+  .attachment-frame { min-height: 360px; height: 65vh; }
+}
 
 /* ---- Part: compaction ---- */
 .part-compaction {

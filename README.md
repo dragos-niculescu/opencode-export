@@ -194,7 +194,10 @@ The `html` command uses the same PHP renderer, session template, theme, Markdown
 ```bash
 opencode-export html <session_id> -o session.html
 opencode-export html <session_id> > session.html
+opencode-export html <session_id> --with-attachments -o session-with-files.html
 ```
+
+By default, attachments are listed without embedding their contents. Add `--with-attachments` to include collapsible inline images, sandboxed interactive HTML attachments, and downloadable embedded files.
 
 PHP 8.1 or newer is required. The client locates `server/app/render-cli.php` relative to the `opencode-export` executable. If the client and server files are installed separately, set `OPENCODE_EXPORT_ROOT` to the project root. The page references the same highlight.js CDN assets as the web GUI, so syntax highlighting requires network access when the file is opened.
 
